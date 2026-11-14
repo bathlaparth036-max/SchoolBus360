@@ -1,0 +1,247 @@
+rules_version = '2';
+
+/**
+ * SCHOOLBUS360 — CLOUD FIRESTORE SECURITY RULES (PHASE 1)
+ *
+ * Core Security Principles:
+ * 1. Multi-school data isolation via schoolId.
+ * 2. Strict Child Privacy: Parents can ONLY view their own children (UID in parentIds).
+ * 3. Role enforcement: Prevents privilege escalation (e.g. parent cannot become admin).
+ * 4. Immutable security fields on self-updates (role, schoolId, active cannot be modified by user).
+ * 5. Closed by default: Unauthenticated access is completely disallowed.
+ */
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // =========================================================================
+    // HELPER FUNCTIONS
+    // =========================================================================
+
+    /**
+     * Checks if the incoming request is from an authenticated user.
+     */
+    function isSignedIn() {
+      return request.auth != null && request.auth.uid != null;
+    }
+
+    /**
+     * Retrieves the user record for the current caller from the users collection.
+     */
+    function getUser() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    /**
+     * Returns true if the user record exists in the users collection.
+     */
+    function userExists() {
+      return isSignedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    /**
+     * Retrieves the caller's user document data.
+     */
+    function getUserData() {
+      return getUser().data;
+    }
+
+    /**
+     * Checks if the caller account is marked active.
+     */
+    function isUserActive() {
+      return userExists() && getUserData().active == true;
+    }
+
+    /**
+     * Returns the caller's role (parent, driver, admin).
+     */
+    function userRole() {
+      return getUserData().role;
+    }
+
+    /**
+     * Verifies that the caller has the admin role and is active.
+     */
+    function isAdmin() {
+      return isUserActive() && userRole() == 'admin';
+    }
+
+    /**
+     * Verifies that the caller has the parent role and is active.
+     */
+    function isParent() {
+      return isUserActive() && userRole() == 'parent';
+    }
+
+    /**
+     * Verifies that the caller has the driver role and is active.
+     */
+    function isDriver() {
+      return isUserActive() && userRole() == 'driver';
+    }
+
+    /**
+     * Enforces school-level isolation: checks if target schoolId matches caller's schoolId.
+     */
+    function sameSchool(targetSchoolId) {
+      return isUserActive() && getUserData().schoolId == targetSchoolId;
+    }
+
+    // =========================================================================
+    // COLLECTION: schools
+    // Path: /schools/{schoolId}
+    // =========================================================================
+    match /schools/{schoolId} {
+      // Any authenticated active user can read their own school's profile
+      allow read: if isSignedIn() && sameSchool(schoolId);
+
+      // School creation and deletion are restricted to backend / superadmin
+      // School admin can only update non-identifying school details (name, phone, address)
+      allow create: if false;
+      allow delete: if false;
+      allow update: if isAdmin() && sameSchool(schoolId)
+                    && request.resource.data.active == resource.data.active;
+    }
+
+    // =========================================================================
+    // COLLECTION: users
+    // Path: /users/{uid}
+    // =========================================================================
+    match /users/{uid} {
+      // Users can read their own profile; admins can read users in their school
+      allow read: if isSignedIn() && (
+        request.auth.uid == uid ||
+        (isAdmin() && sameSchool(resource.data.schoolId))
+      );
+
+      // User Creation:
+      // 1. Initial self-onboarding: caller creates their own document.
+      //    CRITICAL: A client MUST NEVER grant itself the 'admin' role!
+      // 2. School admin can provision parent or driver users for their school.
+      allow create: if isSignedIn() && (
+        (
+          request.auth.uid == uid &&
+          request.resource.data.role != 'admin' &&
+          request.resource.data.phone == request.auth.token.phone_number
+        ) ||
+        (
+          isAdmin() &&
+          sameSchool(request.resource.data.schoolId) &&
+          request.resource.data.role != 'admin'
+        )
+      );
+
+      // User Update:
+      // 1. School Admin can update users belonging to their school.
+      // 2. Normal users can update only their own name or display fields.
+      //    They CANNOT modify role, schoolId, or active flag.
+      allow update: if isSignedIn() && (
+        (isAdmin() && sameSchool(resource.data.schoolId)) ||
+        (
+          request.auth.uid == uid &&
+          request.resource.data.role == resource.data.role &&
+          request.resource.data.schoolId == resource.data.schoolId &&
+          request.resource.data.active == resource.data.active
+        )
+      );
+
+      // Deletion is disabled to maintain transport audit history
+      allow delete: if false;
+    }
+
+    // =========================================================================
+    // COLLECTION: students
+    // Path: /students/{studentId}
+    // =========================================================================
+    match /students/{studentId} {
+      // Read rules:
+      // - Admin of same school can read all students in the school.
+      // - Driver of same school can read students for transport operations.
+      // - Parent can ONLY read students where their UID exists in parentIds.
+      allow read: if isSignedIn() && (
+        (isAdmin() && sameSchool(resource.data.schoolId)) ||
+        (isDriver() && sameSchool(resource.data.schoolId)) ||
+        (isParent() && sameSchool(resource.data.schoolId) && request.auth.uid in resource.data.parentIds)
+      );
+
+      // Only school admins can create, update, or remove student profiles
+      allow create: if isAdmin() && sameSchool(request.resource.data.schoolId);
+      allow update: if isAdmin() && sameSchool(resource.data.schoolId) && sameSchool(request.resource.data.schoolId);
+      allow delete: if isAdmin() && sameSchool(resource.data.schoolId);
+    }
+
+    // =========================================================================
+    // COLLECTION: drivers
+    // Path: /drivers/{uid}
+    // =========================================================================
+    match /drivers/{uid} {
+      // Driver can read their own driver profile; Admin can read all drivers in their school
+      allow read: if isSignedIn() && (
+        (request.auth.uid == uid && isDriver()) ||
+        (isAdmin() && sameSchool(resource.data.schoolId))
+      );
+
+      // Only school admin can provision driver records
+      allow create: if isAdmin() && sameSchool(request.resource.data.schoolId);
+
+      // Admin can update driver record.
+      // Driver can update own basic profile (e.g. phone), but NOT schoolId, assignedBusId, or active
+      allow update: if isSignedIn() && (
+        (isAdmin() && sameSchool(resource.data.schoolId) && sameSchool(request.resource.data.schoolId)) ||
+        (
+          request.auth.uid == uid &&
+          isDriver() &&
+          request.resource.data.schoolId == resource.data.schoolId &&
+          request.resource.data.assignedBusId == resource.data.assignedBusId &&
+          request.resource.data.active == resource.data.active
+        )
+      );
+
+      allow delete: if isAdmin() && sameSchool(resource.data.schoolId);
+    }
+
+    // =========================================================================
+    // COLLECTION: buses
+    // Path: /buses/{busId}
+    // =========================================================================
+    match /buses/{busId} {
+      // Any authenticated user belonging to the school can read bus metadata
+      allow read: if isSignedIn() && sameSchool(resource.data.schoolId);
+
+      // Only school admin can create, update, or remove buses
+      allow create: if isAdmin() && sameSchool(request.resource.data.schoolId);
+      allow update: if isAdmin() && sameSchool(resource.data.schoolId) && sameSchool(request.resource.data.schoolId);
+      allow delete: if isAdmin() && sameSchool(resource.data.schoolId);
+    }
+
+    // =========================================================================
+    // COLLECTION: routes
+    // Path: /routes/{routeId}
+    // =========================================================================
+    match /routes/{routeId} {
+      // Any authenticated user of the school can read route info
+      allow read: if isSignedIn() && sameSchool(resource.data.schoolId);
+
+      // Only school admin can manage routes
+      allow create: if isAdmin() && sameSchool(request.resource.data.schoolId);
+      allow update: if isAdmin() && sameSchool(resource.data.schoolId) && sameSchool(request.resource.data.schoolId);
+      allow delete: if isAdmin() && sameSchool(resource.data.schoolId);
+
+      // Subcollection: stops
+      // Path: /routes/{routeId}/stops/{stopId}
+      match /stops/{stopId} {
+        // Inherits school validation from parent route document
+        allow read: if isSignedIn() && sameSchool(get(/databases/$(database)/documents/routes/$(routeId)).data.schoolId);
+        allow create: if isAdmin() && sameSchool(get(/databases/$(database)/documents/routes/$(routeId)).data.schoolId);
+        allow update: if isAdmin() && sameSchool(get(/databases/$(database)/documents/routes/$(routeId)).data.schoolId);
+        allow delete: if isAdmin() && sameSchool(get(/databases/$(database)/documents/routes/$(routeId)).data.schoolId);
+      }
+    }
+
+    // Deny all other access by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

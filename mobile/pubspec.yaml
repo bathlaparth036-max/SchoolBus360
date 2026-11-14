@@ -1,0 +1,36 @@
+name: schoolbus360
+description: "SchoolBus360 — Phase 1 Production-Oriented School Transport Platform"
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+  flutter: ">=3.19.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Firebase Core and Authentication
+  firebase_core: ^3.6.0
+  firebase_auth: ^5.3.1
+  cloud_firestore: ^5.4.4
+  firebase_messaging: ^15.1.3
+
+  # OpenStreetMap mapping foundation (No Google Maps)
+  flutter_map: ^7.0.2
+  latlong2: ^0.9.1
+
+  # Network connectivity monitoring for patchy Indian mobile networks
+  connectivity_plus: ^6.1.0
+
+  # Lightweight, robust state management
+  provider: ^6.1.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
